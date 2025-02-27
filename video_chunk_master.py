@@ -866,15 +866,15 @@ def pronunciation():
 
 
 def podcast():
-    _OUTPUT_DIR = "/Users/shohimardonabdurashitov/Documents/Podcast/Feb_18/tmp"
+    _OUTPUT_DIR = "/Users/shohimardonabdurashitov/Documents/Podcast/Feb_18/new_v_1_0"
 
     videos = [
-        'https://www.youtube.com/watch?v=Q4qWzbP0q7I&ab_channel=AndrewHuberman',
+        'https://www.youtube.com/watch?v=N5DAW8mkJ6Y&ab_channel=AndrewHuberman',
     ]
 
     _WORDS_PER_SEGMENT = 1000
-    cut_start = "00:00:00"
-    cut_end = "00:30:00"
+    cut_start = None
+    cut_end = None
 
     for url in videos:
         start_thread(url, _OUTPUT_DIR, _WORDS_PER_SEGMENT, cut_start, cut_end)
@@ -896,4 +896,4 @@ def listenAndWrite():
 
 
 if __name__ == '__main__':
-    listenAndWrite()
+    podcast()

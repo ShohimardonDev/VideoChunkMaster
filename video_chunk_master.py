@@ -324,7 +324,6 @@ def adjust_timestamp(original: str, offset: float, is_double_line: bool = False)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
-
 def parse_timestamp_s(timestamp: str) -> float:
     """Parse SRT timestamp format (HH:MM:SS,mmm) to seconds with better precision."""
     parts = timestamp.split(':')
@@ -648,113 +647,274 @@ def download_from_youtube(url, download_path):
     if not os.path.exists(download_path):
         os.makedirs(download_path)
 
-    # Generate a unique snake_case filename
+    # Generate a unique snake_case filename for fallback
     temp_id = str(uuid.uuid4()).replace("-", "_")
+    video_title = temp_id
+    snake_case_title = temp_id
+    video_filename = os.path.join(download_path, f"{temp_id}.mp4")
+    subtitle_filename = os.path.join(download_path, f"{temp_id}.en.srt")
 
-    # Get video info first without downloading
-    ydl_info = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'forcejson': True,
-    }
-
+    # Step 1: Try to get video info first without downloading
     try:
+        ydl_info = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'forcejson': True,
+            'ignoreerrors': True,  # Continue despite errors
+        }
+
         with YoutubeDL(ydl_info) as ydl:
             info_dict = ydl.extract_info(url, download=False)
-            video_title = info_dict.get('title', temp_id)
-            snake_case_title = to_snake_case(video_title)
 
-            # Define file paths
-            video_filename = os.path.join(download_path, f"{snake_case_title}.mp4")
-            subtitle_filename = os.path.join(download_path, f"{snake_case_title}.en.srt")
+            if info_dict:
+                video_title = info_dict.get('title', temp_id)
+                snake_case_title = to_snake_case(video_title)
 
-            # Skip if already downloaded
-            if os.path.exists(video_filename) and os.path.exists(subtitle_filename):
-                print(f"Video and subtitles already exist: {video_filename}")
-                return video_filename, subtitle_filename, video_title, snake_case_title
+                # Define file paths
+                video_filename = os.path.join(download_path, f"{snake_case_title}.mp4")
+                subtitle_filename = os.path.join(download_path, f"{snake_case_title}.en.srt")
+
+                # Get available formats
+                available_formats = info_dict.get('formats', [])
+
+                # Skip if already downloaded
+                if os.path.exists(video_filename) and os.path.getsize(video_filename) > 0:
+                    print(f"Video already exists: {video_filename}")
+                    if os.path.exists(subtitle_filename) and os.path.getsize(subtitle_filename) > 0:
+                        print(f"Subtitles already exist: {subtitle_filename}")
+                    else:
+                        try:
+                            download_subtitle(url, subtitle_filename)
+                            print(f"Downloaded subtitles separately: {subtitle_filename}")
+                        except Exception as sub_e:
+                            print(f"Subtitle download failed: {str(sub_e)}")
+
+                    return video_filename, subtitle_filename, video_title, snake_case_title
     except Exception as e:
-        print(f"Error extracting video info: {str(e)}")
-        # Fallback to temp ID if title extraction fails
-        snake_case_title = temp_id
-        video_filename = os.path.join(download_path, f"{snake_case_title}.mp4")
-        subtitle_filename = os.path.join(download_path, f"{snake_case_title}.en.srt")
-        video_title = temp_id
+        print(f"Warning: Error extracting video info: {str(e)}. Using fallback method.")
+        # Continue with fallback values set earlier
 
-    # Download video with optimized settings
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prefer MP4 for better compatibility
-        'outtmpl': video_filename,
-        'subtitleslangs': ['en'],
-        'writesubtitles': True,
-        'writeautomaticsub': True,
-        'subtitlesformat': 'srt',  # Use SRT format directly
-        'postprocessors': [
-            {
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            },
-            {
-                'key': 'FFmpegEmbedSubtitle',  # Embed subtitles in the video file
-                'already_have_subtitle': False,
-            },
-            {
-                'key': 'FFmpegMetadata',  # Preserve metadata
-                'add_metadata': True,
+    # Step 2: Prepare download options with multiple format fallbacks
+    format_options = [
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # First try best quality
+        'best[ext=mp4]/best',  # Then try any mp4
+        'best'  # Finally try any format
+    ]
+
+    subtitle_options = [
+        {'format': 'srt', 'language': 'en'},
+        {'format': 'vtt', 'language': 'en'},
+        {'format': 'ass', 'language': 'en'},
+        {'format': 'srt', 'language': 'en-US'},
+        {'format': 'vtt', 'language': 'en-US'}
+    ]
+
+    # Try each format option until one works
+    for format_choice in format_options:
+        try:
+            print(f"Trying format: {format_choice}")
+
+            ydl_opts = {
+                'format': format_choice,
+                'outtmpl': video_filename,
+                'subtitleslangs': ['en', 'en-US'],  # Try both English variants
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'ignoreerrors': True,  # Continue despite errors
+                'nooverwrites': False,  # Allow overwriting
+                'noplaylist': True,  # Download single video only
+                'postprocessors': [
+                    {
+                        'key': 'FFmpegVideoConvertor',
+                        'preferedformat': 'mp4',
+                    }
+                ],
+                'concurrent_fragment_downloads': 8,  # Multiple fragment downloads
+                'retries': 15,  # More retries for better reliability
+                'file_access_retries': 10,
+                'fragment_retries': 15,
+                'skip_unavailable_fragments': True,  # Skip unavailable fragments
+                'keepvideo': True,  # Keep video file after post-processing
+                'verbose': False,
             }
-        ],
-        'concurrent_fragment_downloads': 8,  # Multiple fragment downloads
-        'retries': 10,  # More retries for better reliability
-        'file_access_retries': 5,
-        'fragment_retries': 10,
-        'skip_unavailable_fragments': False,
-        'keepvideo': True,  # Keep video file after post-processing
-        'verbose': False,
-        'progress_hooks': [lambda d: print(f"Downloading: {d['status']} - {d.get('_percent_str', '0%')}")
-        if d['status'] == 'downloading' else None],
-    }
 
-    try:
-        with tqdm(desc="Downloading video", unit="B", unit_scale=True, miniters=1) as progress_bar:
-            def progress_hook(d):
-                if d['status'] == 'downloading':
-                    if 'total_bytes' in d and 'downloaded_bytes' in d:
-                        progress_bar.total = d['total_bytes']
-                        progress_bar.n = d['downloaded_bytes']
-                        progress_bar.refresh()
+            with tqdm(desc=f"Downloading video ({format_choice})", unit="B", unit_scale=True,
+                      miniters=1) as progress_bar:
+                def progress_hook(d):
+                    if d['status'] == 'downloading':
+                        if 'total_bytes' in d and 'downloaded_bytes' in d:
+                            progress_bar.total = d['total_bytes']
+                            progress_bar.n = d['downloaded_bytes']
+                            progress_bar.refresh()
 
-            ydl_opts['progress_hooks'] = [progress_hook]
-            with YoutubeDL(ydl_opts) as ydl:
+                ydl_opts['progress_hooks'] = [progress_hook]
+                with YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+
+            # If we get here without exception, the download succeeded
+            if os.path.exists(video_filename) and os.path.getsize(video_filename) > 0:
+                print(f"Successfully downloaded video with format: {format_choice}")
+                break
+            else:
+                print(f"Download appeared to succeed but file is missing or empty. Trying next format.")
+        except Exception as e:
+            print(f"Error with format {format_choice}: {str(e)}")
+            # Continue to next format option
+
+    # Step 3: Verify download and try to get subtitles if needed
+    if not os.path.exists(video_filename) or os.path.getsize(video_filename) == 0:
+        raise Exception("Failed to download video with any available format")
+
+    # Try each subtitle option until one works
+    subtitle_downloaded = False
+    for sub_option in subtitle_options:
+        if subtitle_downloaded:
+            break
+
+        try:
+            sub_format = sub_option['format']
+            sub_lang = sub_option['language']
+            temp_subtitle = os.path.join(download_path, f"{snake_case_title}.{sub_lang}.{sub_format}")
+
+            sub_opts = {
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': [sub_lang],
+                'subtitlesformat': sub_format,
+                'outtmpl': os.path.join(download_path, f"{snake_case_title}"),
+                'ignoreerrors': True,
+            }
+
+            with YoutubeDL(sub_opts) as ydl:
                 ydl.download([url])
 
-        # Try to download subtitles separately in case they weren't properly extracted
-        if not os.path.exists(subtitle_filename):
-            try:
-                download_subtitle(url, subtitle_filename)
-                print(f"Downloaded subtitles separately: {subtitle_filename}")
-            except Exception as sub_e:
-                print(f"Subtitle download failed: {str(sub_e)}")
+            # Check if subtitle was downloaded
+            if os.path.exists(temp_subtitle) and os.path.getsize(temp_subtitle) > 0:
+                # Convert to SRT if needed
+                if sub_format != 'srt':
+                    try:
+                        convert_subtitle_to_srt(temp_subtitle, subtitle_filename)
+                        print(f"Converted {sub_format} subtitle to SRT format")
+                    except Exception as conv_e:
+                        print(f"Failed to convert subtitle: {str(conv_e)}")
+                        # Use the subtitle we have if conversion fails
+                        subtitle_filename = temp_subtitle
+                else:
+                    subtitle_filename = temp_subtitle
 
-        # Check if subtitles were downloaded and try to embed them if they weren't embedded
-        if os.path.exists(subtitle_filename) and os.path.exists(video_filename):
-            try:
-                embed_subtitles(video_filename, subtitle_filename)
-                print(f"Embedded subtitles into video: {video_filename}")
-            except Exception as embed_e:
-                print(f"Failed to embed subtitles: {str(embed_e)}")
+                subtitle_downloaded = True
+                print(f"Successfully downloaded subtitles: {subtitle_filename}")
+        except Exception as sub_e:
+            print(f"Failed to download subtitles with {sub_option}: {str(sub_e)}")
 
-        return video_filename, subtitle_filename, video_title, snake_case_title
+    # Step 4: Try to embed subtitles if both files exist
+    if subtitle_downloaded and os.path.exists(video_filename) and os.path.exists(subtitle_filename):
+        try:
+            embed_subtitles(video_filename, subtitle_filename)
+            print(f"Embedded subtitles into video: {video_filename}")
+        except Exception as embed_e:
+            print(f"Failed to embed subtitles: {str(embed_e)}")
 
+    # Step 5: Return paths even if subtitle download failed
+    return video_filename, subtitle_filename, video_title, snake_case_title
+
+
+def convert_subtitle_to_srt(input_path, output_path):
+    """
+    Convert subtitle files to SRT format using FFmpeg
+
+    Args:
+        input_path (str): Path to input subtitle file
+        output_path (str): Path to output SRT file
+    """
+    try:
+        subprocess.run([
+            'ffmpeg', '-i', input_path,
+            '-f', 'srt', output_path
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return True
     except Exception as e:
-        print(f"Error downloading video: {str(e)}")
-        # Clean up any partial downloads
-        for path in [video_filename, subtitle_filename]:
-            if os.path.exists(path):
+        print(f"Subtitle conversion error: {str(e)}")
+        return False
+
+
+def download_subtitle(url, output_path):
+    """
+    Download subtitles separately
+
+    Args:
+        url (str): YouTube video URL
+        output_path (str): Path to save subtitle file
+    """
+    ydl_opts = {
+        'skip_download': True,
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['en', 'en-US'],
+        'subtitlesformat': 'srt/vtt/ass/best',
+        'outtmpl': output_path.replace('.en.srt', ''),
+        'ignoreerrors': True,
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+
+    # Check if subtitle was downloaded with various possible extensions
+    possible_paths = [
+        output_path,
+        output_path.replace('.en.srt', '.en.vtt'),
+        output_path.replace('.en.srt', '.en-US.srt'),
+        output_path.replace('.en.srt', '.en-US.vtt'),
+        output_path.replace('.en.srt', '.en.ass'),
+    ]
+
+    for path in possible_paths:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            # Convert to SRT if it's not already
+            if not path.endswith('.srt'):
                 try:
-                    os.remove(path)
-                except:
-                    pass
-        raise e
+                    convert_subtitle_to_srt(path, output_path)
+                    os.remove(path)  # Remove original after conversion
+                except Exception:
+                    # If conversion fails, just copy the file
+                    shutil.copy(path, output_path)
+            elif path != output_path:
+                shutil.copy(path, output_path)
+
+            return True
+
+    return False
+
+
+def embed_subtitles(video_path, subtitle_path):
+    """
+    Embed subtitles into video file using FFmpeg
+
+    Args:
+        video_path (str): Path to video file
+        subtitle_path (str): Path to subtitle file
+    """
+    output_path = video_path + ".temp.mp4"
+
+    try:
+        subprocess.run([
+            'ffmpeg', '-i', video_path,
+            '-i', subtitle_path,
+            '-c:v', 'copy', '-c:a', 'copy',
+            '-c:s', 'mov_text', '-metadata:s:s:0', 'language=eng',
+            output_path
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Replace original with new file
+        os.replace(output_path, video_path)
+        return True
+    except Exception as e:
+        print(f"Error embedding subtitles: {str(e)}")
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        return False
 
 
 def download_from_youtube_single_thread(url, download_path):
@@ -790,7 +950,8 @@ def download_from_youtube_single_thread(url, download_path):
     return video_filename, subtitle_filename, video_title
 
 
-def download_and_process_video(url, download_path, WORDS_PER_SEGMENT, cut_start=None, cut_end=None):
+def download_and_process_video(url, download_path, WORDS_PER_SEGMENT, cut_start=None, cut_end=None,
+                               existing_video_path=None, existing_subtitle_path=None, existing_title=None):
     """
     Download and process a YouTube video with improved quality.
 
@@ -803,7 +964,17 @@ def download_and_process_video(url, download_path, WORDS_PER_SEGMENT, cut_start=
     """
     print(f"Processing video: {url}")
     try:
-        VIDEO_PATH, SUBTITLE_PATH, video_title, title = download_from_youtube(url, download_path)
+        VIDEO_PATH = None
+        SUBTITLE_PATH = None
+        video_title = None,
+        title = None
+        if existing_video_path and existing_subtitle_path and existing_title:
+            VIDEO_PATH = existing_video_path
+            SUBTITLE_PATH = existing_subtitle_path
+            video_title = existing_title
+            title = existing_title
+        else:
+            VIDEO_PATH, SUBTITLE_PATH, video_title, title = download_from_youtube(url, download_path)
         print(f"Video downloaded to: {VIDEO_PATH}")
         print(f"Subtitle path: {SUBTITLE_PATH}")
 
@@ -845,7 +1016,8 @@ def find_matching_video_subtitles(directory: str):
                 print(f"Failed to process {name}: {e}")
 
 
-def start_thread(url, download_path, WORDS_PER_SEGMENT, cut_start=None, cut_end=None):
+def start_thread(download_path, WORDS_PER_SEGMENT, cut_start=None, cut_end=None,
+                 existing_video_path=None, existing_subtitle_path=None, existing_title="", url=None):
     """
     Start a thread to download and process a video.
 
@@ -863,7 +1035,8 @@ def start_thread(url, download_path, WORDS_PER_SEGMENT, cut_start=None, cut_end=
 
     # Create a thread for each video
     thread = Thread(target=download_and_process_video,
-                    args=(url, video_download_path, WORDS_PER_SEGMENT, cut_start, cut_end))
+                    args=(url, video_download_path, WORDS_PER_SEGMENT, cut_start, cut_end, existing_video_path,
+                          existing_subtitle_path, existing_title))
     thread.start()
     thread.join()
 
@@ -892,19 +1065,32 @@ def start_thread(url, download_path, WORDS_PER_SEGMENT, cut_start=None, cut_end=
 
 
 def pronunciation():
-    OUTPUT_DIR = "/Users/shohimardonabdurashitov/Documents/English/Pronounstation/MARCH_7/network"
+    OUTPUT_DIR = "/Users/shohimardonabdurashitov/test/pro/tmp_1/down"
 
     videos = [
-        'https://www.youtube.com/watch?v=7bA0gTroJjw&ab_channel=NetworkChuck',
+        'https://www.youtube.com/watch?v=cJZnlnT0rPA',
         # 'https://www.youtube.com/watch?v=nsi008avBfo&ab_channel=NetworkChuck'
     ]
 
-    WORDS_PER_SEGMENT = 50
+    WORDS_PER_SEGMENT = 70
     cut_start = "00:00:00"
     cut_end = "00:20:00"
 
     for url in videos:
         start_thread(url, OUTPUT_DIR, WORDS_PER_SEGMENT, cut_start, cut_end)
+
+
+def pronunciationExistFile():
+    OUTPUT_DIR = "/Users/shohimardonabdurashitov/test/pro/tmp_1/down"
+
+    existing_video_path = "/Users/shohimardonabdurashitov/PycharmProjects/VideoChunkMaster/everyone is putting AI in schools.......mkv"
+    existing_subtitle_path = "/Users/shohimardonabdurashitov/PycharmProjects/VideoChunkMaster/[English (auto-generated)] everyone is putting AI in schools...... [DownSub.com].srt"
+    existing_title = "everyone is putting AI in schools......."
+    WORDS_PER_SEGMENT = 70
+    cut_start = "00:00:00"
+    cut_end = "00:20:00"
+    start_thread(OUTPUT_DIR, WORDS_PER_SEGMENT, cut_start, cut_end, existing_video_path, existing_subtitle_path,
+                 existing_title, url="https://www.youtube.com/watch?v=cJZnlnT0rPA")
 
 
 def podcast():
@@ -919,7 +1105,7 @@ def podcast():
     cut_end = None
 
     for url in videos:
-        start_thread(url, _OUTPUT_DIR, _WORDS_PER_SEGMENT, cut_start, cut_end)
+        start_thread(_OUTPUT_DIR, _WORDS_PER_SEGMENT, cut_start, cut_end, url=url)
 
 
 def listenAndWrite():
@@ -934,8 +1120,8 @@ def listenAndWrite():
     cut_end = "00:10:00"
 
     for url in videos:
-        start_thread(url, _OUTPUT_DIR, _WORDS_PER_SEGMENT, cut_start, cut_end)
+        start_thread(_OUTPUT_DIR, _WORDS_PER_SEGMENT, cut_start, cut_end, url=url)
 
 
 if __name__ == '__main__':
-    pronunciation()
+    pronunciationExistFile()

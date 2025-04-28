@@ -1,20 +1,22 @@
 import json
-import os
-import re
-import shutil
-import subprocess
-import threading
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 
-import requests
 import yt_dlp
-from requests.adapters import HTTPAdapter
-from tqdm import tqdm
-from urllib3.util.retry import Retry
 from youtube_transcript_api import YouTubeTranscriptApi
+
+import os
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import threading
+import uuid
 from yt_dlp import YoutubeDL
+from tqdm import tqdm
+import subprocess
+import re
+
+import shutil
 
 
 def extract_files(input_path):
@@ -100,18 +102,6 @@ def download_subtitle(url, output_path):
         raise Exception(f"Error downloading subtitles: {str(e)}")
 
 
-def format_time_srt(seconds_float):
-    """
-    Convert seconds to SRT time format (HH:MM:SS,mmm) with proper handling of milliseconds.
-    """
-    hours = int(seconds_float // 3600)
-    minutes = int((seconds_float % 3600) // 60)
-    seconds = int(seconds_float % 60)
-    milliseconds = int((seconds_float - int(seconds_float)) * 1000)
-
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
-
-
 def format_time(seconds):
     """
     Convert seconds to SRT time format (HH:MM:SS,mmm)
@@ -149,14 +139,15 @@ def parse_timestamp(timestamp):
     return int(h) * 3600 + int(m) * 60 + float(s.replace(",", "."))
 
 
-def embed_subtitles(video_file: str, subtitle_file: str):
+def embed_subtitles(video_file: str, subtitle_file: str, overwrite: bool = True):
     """
     Embeds subtitles into a video file using FFmpeg and overwrites the original file safely.
-    Added better error handling and subtitle encoding.
+
+    :param video_file: Path to the input video file.
+    :param subtitle_file: Path to the subtitle file (.srt).
+    :param overwrite: Whether to overwrite the original file (default: True).
+    :raises subprocess.CalledProcessError: If FFmpeg command fails.
     """
-    if not os.path.exists(subtitle_file) or os.path.getsize(subtitle_file) == 0:
-        print(f"Warning: Subtitle file {subtitle_file} is empty or missing. Skipping embedding.")
-        return
 
     temp_output = f"{video_file}.temp.mp4"  # Temporary output file
 
@@ -167,7 +158,6 @@ def embed_subtitles(video_file: str, subtitle_file: str):
         '-c:v', 'copy',  # Copy video codec
         '-c:a', 'copy',  # Copy audio codec
         '-c:s', 'mov_text',  # Set subtitle codec for MP4
-        '-metadata:s:s:0', 'language=eng',  # Set subtitle language
         '-y',  # Overwrite without prompt
         temp_output  # Temporary output file
     ]
@@ -180,8 +170,7 @@ def embed_subtitles(video_file: str, subtitle_file: str):
         print(f"Subtitles embedded successfully: {video_file}")
 
     except subprocess.CalledProcessError as e:
-        error_output = e.stderr.decode().strip() if e.stderr else "Unknown error"
-        print(f"Error embedding subtitles: {error_output}")
+        print(f"Error embedding subtitles: {e.stderr.decode().strip()}")
         # Cleanup temp file if failed
         if os.path.exists(temp_output):
             os.remove(temp_output)
@@ -220,27 +209,14 @@ def batch_process_videos(video_urls, output_dir, words_per_segment=120,
 
 
 def save_video_clip(start_time, end_time, video_file, output_file, cut_start=None, cut_end=None):
-    """
-    Save a video clip with proper time handling.
-    Fixed to handle timestamp conversion consistently.
-    """
     try:
-        # Convert string timestamps to seconds if needed
-        if isinstance(cut_start, str):
-            cut_start_time = parse_timestamp(cut_start)
-        else:
-            cut_start_time = cut_start
-
-        if isinstance(cut_end, str):
-            cut_end_time = parse_timestamp(cut_end)
-        else:
-            cut_end_time = cut_end
-
         # Adjust start and end times based on optional cut_start and cut_end
-        if cut_start_time is not None:
+        if cut_start:
+            cut_start_time = parse_timestamp_own(cut_start)
             start_time = max(start_time, cut_start_time)
 
-        if cut_end_time is not None:
+        if cut_end:
+            cut_end_time = parse_timestamp_own(cut_end)
             end_time = min(end_time, cut_end_time)
 
         if start_time >= end_time:
@@ -262,7 +238,6 @@ def save_video_clip(start_time, end_time, video_file, output_file, cut_start=Non
                 "-c:a", "aac",
                 "-strict", "experimental",
                 "-progress", "pipe:1",  # Enable progress output
-                "-y",  # Add -y to overwrite without asking
                 output_file
             ]
 
@@ -278,12 +253,13 @@ def save_video_clip(start_time, end_time, video_file, output_file, cut_start=Non
                     if match:
                         h, m, s = map(int, match.groups())
                         elapsed = h * 3600 + m * 60 + s
-                        progress_bar.n = min(elapsed, total_duration)  # Cap at total duration
+                        progress_bar.n = elapsed
                         progress_bar.refresh()
 
             process.wait()
             if process.returncode == 0:
                 print(f"\nVideo clip saved to {output_file}")
+
             else:
                 print(f"\nFFmpeg error with return code {process.returncode}")
 
@@ -300,33 +276,29 @@ def parse_timestamp_own(timestamp):
 
 
 def adjust_timestamp(original: str, offset: float, is_double_line: bool = False) -> str:
-    """
-    Adjust the timestamp by subtracting the offset and ensuring it aligns properly with subtitles and audio.
-    Properly handles timing adjustments with millisecond precision.
-    """
-    # Parse hours, minutes, seconds, and milliseconds
-    h, m, s = original.split(':')
-    seconds, milliseconds = s.split(',')
+    """Adjust the timestamp by subtracting offset and ensuring a minimum start time of 00:00:02.000."""
+    # Parse the timestamp more carefully to preserve millisecond precision
+    parts = original.split(':')
+    h, m = float(parts[0]), float(parts[1])
+    s_parts = parts[2].split(',')
+    s = float(s_parts[0]) + float(s_parts[1]) / 1000
 
-    # Convert to total seconds for easier manipulation
-    total_seconds = int(h) * 3600 + int(m) * 60 + int(seconds) + int(milliseconds) / 1000.0 - offset
+    total_seconds = max(2.0, h * 3600 + m * 60 + s - offset)
 
-    # Ensure total time is never less than 1 second
-    total_seconds = max(1, total_seconds)
-
-    # Recalculate hours, minutes, seconds, and milliseconds
+    # Format with proper handling of milliseconds
     hours = int(total_seconds // 3600)
     minutes = int((total_seconds % 3600) // 60)
     seconds = int(total_seconds % 60)
+    if float(seconds) > 1.5 and is_double_line == False:
+        seconds -= 2
+        # print()
     milliseconds = int((total_seconds - int(total_seconds)) * 1000)
 
-    # Format with leading zeros where necessary
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
-
 def parse_timestamp_s(timestamp: str) -> float:
-    """Parse SRT timestamp format (HH:MM:SS,mmm) to seconds with better precision."""
+    """Parse SRT timestamp format (HH:MM:SS,mmm) to seconds."""
     parts = timestamp.split(':')
     h, m = float(parts[0]), float(parts[1])
     s_parts = parts[2].split(',')
@@ -335,48 +307,59 @@ def parse_timestamp_s(timestamp: str) -> float:
 
 
 def save_section(section_id, blocks, output_dir, word_limit, sub_name):
-    """
-    Save subtitle section and corresponding video clip with adjusted timestamps.
-    Fixed to handle subtitle timing correctly.
-    """
+    """Save subtitle section and corresponding video clip with adjusted timestamps."""
     if not blocks:
         return None
 
-    # Use the first subtitle's start time as the offset
     original_start_time = parse_timestamp_s(blocks[0][1].split(" --> ")[0])
-    offset = original_start_time
+    offset = original_start_time  # Use first timestamp as the offset
 
-    # Get the overall start and end times for the video segment
-    start_time = original_start_time
-    end_time = parse_timestamp_s(blocks[-1][1].split(" --> ")[1])
+    start_time = parse_timestamp_s(blocks[0][1].split(" --> ")[0])  # Fix: Use the first subtitle's timestamp
+    end_time = parse_timestamp_s(blocks[-1][1].split(" --> ")[1])  # Last subtitle's end timestamp
 
     content = ""
     new_subtitle_id = 1
 
-    # Keep track of previous subtitle end time to prevent overlaps
-    prev_end_time = 0
+    # Keep track of the end time of the previous subtitle
+    last_end_time = 0
 
     for index, timestamp, text in blocks:
         start, end = timestamp.split(" --> ")
         is_double_line = len(text.split("\n")) > 1
+        adjusted_start = adjust_timestamp(start, offset, is_double_line)
+        adjusted_end = adjust_timestamp(end, offset, is_double_line)
 
-        # Calculate adjusted timestamps
-        adjusted_start_time = parse_timestamp_s(start) - offset
-        adjusted_end_time = parse_timestamp_s(end) - offset
+        # Convert adjusted timestamps back to seconds for comparison
+        start_seconds = parse_timestamp(adjusted_start)
+        end_seconds = parse_timestamp(adjusted_end)
 
-        # Ensure no negative times and maintain proper sequence
-        adjusted_start_time = max(prev_end_time + 0.01, max(0.1, adjusted_start_time))
-        adjusted_end_time = max(adjusted_start_time + 0.5, adjusted_end_time)
+        # Ensure this subtitle starts after the previous one ended
+        if start_seconds < last_end_time:
+            # Adjust the start time to be just after the previous subtitle
+            start_seconds = last_end_time + 0.001  # Add 1ms to avoid exact overlap
 
-        # Format timestamps back to SRT format
-        adjusted_start = format_time_srt(adjusted_start_time)
-        adjusted_end = format_time_srt(adjusted_end_time)
+            # Recalculate the timestamp string
+            hours = int(start_seconds // 3600)
+            minutes = int((start_seconds % 3600) // 60)
+            seconds = int(start_seconds % 60)
+            milliseconds = int((start_seconds - int(start_seconds)) * 1000)
+            adjusted_start = f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
-        # Update for next iteration to prevent overlapping
-        prev_end_time = adjusted_end_time
+            # If necessary, also adjust the end time to maintain duration
+            if end_seconds < start_seconds:
+                # Ensure minimum duration of 0.5 seconds
+                end_seconds = start_seconds
+                hours = int(end_seconds // 3600)
+                minutes = int((end_seconds % 3600) // 60)
+                seconds = int(end_seconds % 60)
+                milliseconds = int((end_seconds - int(end_seconds)) * 1000)
+                adjusted_end = f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
         content += f"{new_subtitle_id}\n{adjusted_start} --> {adjusted_end}\n{text}\n\n"
         new_subtitle_id += 1
+
+        # Update last_end_time for the next iteration
+        last_end_time = parse_timestamp(adjusted_end)
 
     subtitle_output = os.path.join(output_dir, f"{sub_name}_{word_limit}_video_part_{section_id}.srt")
     with open(subtitle_output, "w", encoding="utf-8") as out_file:
@@ -388,30 +371,12 @@ def save_section(section_id, blocks, output_dir, word_limit, sub_name):
 
 
 def split_subtitles(input_file, video_file, output_dir, word_limit, sub_name, cut_start=None, cut_end=None):
-    """
-    Split subtitles and video into segments based on word count.
-    Fixed to handle subtitle timing and splits correctly.
-    """
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
     # Read the subtitle file
-    try:
-        with open(input_file, "r", encoding="utf-8") as file:
-            subtitles = file.read()
-    except UnicodeDecodeError:
-        # Try alternate encodings if UTF-8 fails
-        encodings = ['latin-1', 'iso-8859-1', 'windows-1252']
-        for encoding in encodings:
-            try:
-                with open(input_file, "r", encoding=encoding) as file:
-                    subtitles = file.read()
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            print(f"Error: Could not decode subtitle file {input_file} with any known encoding.")
-            return
+    with open(input_file, "r", encoding="utf-8") as file:
+        subtitles = file.read()
 
     subtitle_blocks = re.split(r"\n\n", subtitles.strip())
     parsed_blocks = parse_subtitle_blocks(subtitle_blocks)
@@ -431,20 +396,12 @@ def split_subtitles(input_file, video_file, output_dir, word_limit, sub_name, cu
             try:
                 start_time_sec = parse_timestamp(timestamp.split(" --> ")[0])
             except Exception as e:
-                print(f"Warning: Could not parse timestamp '{timestamp}': {e}")
                 continue
-
             end_time_sec = parse_timestamp(timestamp.split(" --> ")[1])
 
             # Skip if outside cut range
-            if (cut_start_seconds and end_time_sec < cut_start_seconds) or \
-                    (cut_end_seconds and start_time_sec > cut_end_seconds):
-                continue
-
-            # Apply cut range adjustments if needed
-            if cut_start_seconds and start_time_sec < cut_start_seconds:
-                continue
-            if cut_end_seconds and end_time_sec > cut_end_seconds:
+            if (cut_start_seconds and start_time_sec < cut_start_seconds) or \
+                    (cut_end_seconds and end_time_sec > cut_end_seconds):
                 continue
 
             words = text.split()
@@ -464,8 +421,8 @@ def split_subtitles(input_file, video_file, output_dir, word_limit, sub_name, cu
                     if result:
                         start_time, end_time, video_output = result
                         video_tasks.append(
-                            executor.submit(save_video_clip, start_time, end_time, video_file, video_output,
-                                            cut_start_seconds, cut_end_seconds)
+                            executor.submit(save_video_clip, start_time, end_time, video_file, video_output, cut_start,
+                                            cut_end)
                         )
 
                     section_id += 1
@@ -478,16 +435,12 @@ def split_subtitles(input_file, video_file, output_dir, word_limit, sub_name, cu
             if result:
                 start_time, end_time, video_output = result
                 video_tasks.append(
-                    executor.submit(save_video_clip, start_time, end_time, video_file, video_output,
-                                    cut_start, cut_end)
+                    executor.submit(save_video_clip, start_time, end_time, video_file, video_output, cut_start, cut_end)
                 )
 
         # Wait for all video tasks to complete
         for task in video_tasks:
-            try:
-                task.result()
-            except Exception as e:
-                print(f"Error in video processing task: {e}")
+            task.result()
 
 
 def parse_subtitle_blocks(subtitle_blocks):
@@ -529,6 +482,11 @@ def process_current_section(current_section, accumulated_words, split_index):
 def to_snake_case(text):
     # Replace spaces with underscores, remove special characters, and convert to lowercase
     return ''.join([('_' if ch.isspace() else ch.lower()) for ch in text if ch.isalnum() or ch.isspace()])
+
+
+def to_snake_case(string):
+    """Convert string to snake_case."""
+    return string.replace(" ", "_").lower()
 
 
 def create_session_with_retries():
@@ -780,7 +738,7 @@ def download_from_youtube_single_thread(url, download_path):
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        result = ydl.download([url])
 
     title = ydl.extract_info(url, download=False)['title']
 
@@ -891,32 +849,44 @@ def start_thread(url, download_path, WORDS_PER_SEGMENT, cut_start=None, cut_end=
     print(f"Processing complete for: {url}")
 
 
+def pronunciationWithFile():
+    video = "/Users/shohimardonabdurashitov/Documents/English/Pronounstation/FEB_17/5fbc8cfe/"
+    subtitle = "/Users/shohimardonabdurashitov/Documents/English/Pronounstation/FEB_17/5fbc8cfe/ipv6_keeps_getting_hacked_on_windows.en.vtt"
+    WORDS_PER_SEGMENT = 80
+    download_path = "/Users/shohimardonabdurashitov/Documents/English/Pronounstation/FEB_17"
+    print(f"Splitting video into segments of {WORDS_PER_SEGMENT} words...")
+    split_subtitles(subtitle, video, download_path, WORDS_PER_SEGMENT,
+                    sub_name="ipv6_keeps_getting_hacked_on_windows_80", cut_start=None, cut_end=None)
+    find_matching_video_subtitles(download_path)
+
+
 def pronunciation():
-    OUTPUT_DIR = "/Users/shohimardonabdurashitov/Documents/English/Pronounstation/MARCH_7/network"
+    OUTPUT_DIR = "/Users/shohimardonabdurashitov/Documents/English/Pronounstation/FEB_17"
 
     videos = [
-        'https://www.youtube.com/watch?v=7bA0gTroJjw&ab_channel=NetworkChuck',
+        # 'https://www.youtube.com/watch?v=Q4qWzbP0q7I&ab_channel=AndrewHuberman',
         # 'https://www.youtube.com/watch?v=nsi008avBfo&ab_channel=NetworkChuck'
+        'https://www.youtube.com/watch?v=Z_QlUyYlUCg&t=17s&ab_channel=NetworkChuck'
     ]
 
-    WORDS_PER_SEGMENT = 50
-    cut_start = "00:00:00"
-    cut_end = "00:20:00"
+    WORDS_PER_SEGMENT = 80
+    cut_start = None
+    cut_end = None
 
     for url in videos:
         start_thread(url, OUTPUT_DIR, WORDS_PER_SEGMENT, cut_start, cut_end)
 
 
 def podcast():
-    _OUTPUT_DIR = "/Users/shohimardonabdurashitov/Documents/Podcast/Feb_18/new_v_1_0"
+    _OUTPUT_DIR = "/Users/shohimardonabdurashitov/Documents/Podcast/Feb_18/tmp"
 
     videos = [
-        'https://www.youtube.com/watch?v=N5DAW8mkJ6Y&ab_channel=AndrewHuberman',
+        'https://www.youtube.com/watch?v=Q4qWzbP0q7I&ab_channel=AndrewHuberman',
     ]
 
     _WORDS_PER_SEGMENT = 1000
-    cut_start = None
-    cut_end = None
+    cut_start = "00:00:00"
+    cut_end = "00:30:00"
 
     for url in videos:
         start_thread(url, _OUTPUT_DIR, _WORDS_PER_SEGMENT, cut_start, cut_end)
